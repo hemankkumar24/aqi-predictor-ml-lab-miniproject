@@ -1,0 +1,23 @@
+{
+    "naive_baseline_mae": 21.34,
+    "Linear Regression": {
+        "mae": 25.61,
+        "rmse": 39.78,
+        "r2": 0.8047
+    },
+    "Decision Tree": {
+        "mae": 24.57,
+        "rmse": 49.85,
+        "r2": 0.6933
+    },
+    "Random Forest": {
+        "mae": 21.17,
+        "rmse": 38.38,
+        "r2": 0.8182
+    },
+    "Gradient Boosting": {
+        "mae": 21.95,
+        "rmse": 38.72,
+        "r2": 0.815
+    }
+}
