@@ -1,21 +1,4 @@
-# ==============================================================================
-# AirCast India - Model Training Script (train.py)
-#
-# This script trains 4 Machine Learning models to predict tomorrow's AQI
-# across Indian cities using historical air quality data (2015-2020).
-#
-# It performs:
-#   1. Automatic dataset download from Kaggle (if not already present in data/)
-#   2. Data cleaning & robust median imputation
-#   3. Target variable creation (tomorrow's AQI via shift within each city)
-#   4. Time-based train-test split (80% train, 20% test)
-#   5. Training 4 regression models (Linear Reg, Decision Tree, Random Forest, GBDT)
-#   6. Evaluation against a Naive Baseline ("tomorrow = today")
-#   7. Exporting trained models (models.pkl) and performance metrics (metrics.json)
-# ==============================================================================
-
 import os
-import shutil
 import json
 import joblib
 import pandas as pd
@@ -29,117 +12,39 @@ from sklearn.pipeline import Pipeline
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error, r2_score
 
 
-# ------------------------------------------------------------------------------
-# 1. DOWNLOAD DATASET IF MISSING
-# ------------------------------------------------------------------------------
-# We check if data/city_day.csv exists. If not, we attempt to download it
-# automatically from Kaggle using the kagglehub package.
-# ------------------------------------------------------------------------------
-def ensure_dataset():
-    data_dir = "data"
-    target_csv = os.path.join(data_dir, "city_day.csv")
-
-    if os.path.exists(target_csv):
-        print(f"[✓] Dataset already exists at: {target_csv}")
-        return target_csv
-
-    print("[i] 'data/city_day.csv' not found. Attempting download via kagglehub...")
-    os.makedirs(data_dir, exist_ok=True)
-
-    try:
-        import kagglehub
-        # Download the specific dataset slug
-        download_path = kagglehub.dataset_download("rohanrao/air-quality-data-in-india")
-        src_file = os.path.join(download_path, "city_day.csv")
-
-        if os.path.exists(src_file):
-            shutil.copy(src_file, target_csv)
-            print(f"[✓] Successfully downloaded and copied city_day.csv to {target_csv}")
-            return target_csv
-        else:
-            raise FileNotFoundError(f"city_day.csv was not found inside downloaded folder: {download_path}")
-
-    except Exception as err:
-        print("\n" + "=" * 70)
-        print("ERROR: Automatic Kaggle download failed!")
-        print(f"Details: {err}")
-        print("\nPlease either:")
-        print("  1. Configure your Kaggle credentials (~/.kaggle/kaggle.json)")
-        print("  2. OR manually download 'city_day.csv' from:")
-        print("     https://www.kaggle.com/datasets/rohanrao/air-quality-data-in-india")
-        print("     and place it directly into the 'data/' directory.")
-        print("=" * 70 + "\n")
-        raise SystemExit(1)
-
-
-# ------------------------------------------------------------------------------
-# 2. LOAD AND SORT HISTORICAL DATA
-# ------------------------------------------------------------------------------
-# Load the daily city-level air quality observations, parse dates properly,
-# and sort chronologically within each city to allow time-series shifting.
-# ------------------------------------------------------------------------------
-def load_and_preprocess_data(csv_path):
-    print("\n--- Step 2: Loading dataset ---")
+def load_and_preprocess_data(csv_path="data/city_day.csv"):
+    # read the dataset containing daily air quality records across Indian cities
     df = pd.read_csv(csv_path)
     print(f"Loaded {len(df):,} raw records across {df['City'].nunique()} cities.")
 
-    # Convert Date column to datetime
+    # convert Date column to datetime so pandas can handle time-series operations
     df["Date"] = pd.to_datetime(df["Date"])
 
-    # Sort chronologically within each city
+    # sort chronologically by city and date so time-based splitting works properly
     df = df.sort_values(by=["City", "Date"]).reset_index(drop=True)
 
-    # --------------------------------------------------------------------------
-    # 3. CLEANING & IMPUTATION
-    # --------------------------------------------------------------------------
-    # - Drop rows where the target AQI is missing (we cannot train on empty ground truth).
-    # - Impute missing pollutant values with each city's median (robust to extreme spikes).
-    # - If a city is missing an entire pollutant column, fallback to the national median.
-    # --------------------------------------------------------------------------
-    print("\n--- Step 3: Cleaning & Missing Value Imputation ---")
+    # remove rows where the target AQI is missing because we can't train without ground truth
     initial_rows = len(df)
     df = df.dropna(subset=["AQI"]).copy()
     print(f"Dropped {initial_rows - len(df):,} rows with missing AQI. Remaining: {len(df):,}")
 
+    # calculate yesterday's AQI within each city for the persistence benchmark (naive baseline)
+    df["AQI_yesterday"] = df.groupby("City")["AQI"].shift(1)
+
+    # list of 9 core pollutants we are using as features
     pollutant_cols = ["PM2.5", "PM10", "NO", "NO2", "NOx", "NH3", "CO", "SO2", "O3"]
 
+    # missing value imputation:
+    # 1. replace missing pollutant values with the city's median (median is robust against extreme pollution spikes)
+    # 2. if a city has no data at all for a pollutant, fallback to the overall median across all cities
     for pollutant in pollutant_cols:
-        # Group-wise median for the specific city
         city_median = df.groupby("City")[pollutant].transform("median")
         df[pollutant] = df[pollutant].fillna(city_median)
 
-        # Global median fallback in case the entire city had no readings for this pollutant
         global_median = df[pollutant].median()
         df[pollutant] = df[pollutant].fillna(global_median)
 
-    # --------------------------------------------------------------------------
-    # 4. TARGET VARIABLE: AQI OF TOMORROW
-    # --------------------------------------------------------------------------
-    # We shift the AQI column backwards by 1 within each city.
-    # That means for today's row, 'AQI_tomorrow' is the actual AQI measured the next day.
-    # We drop the very last day of each city because tomorrow has not happened yet!
-    # --------------------------------------------------------------------------
-    print("\n--- Step 4: Creating Target Variable (AQI_tomorrow) ---")
-    df["AQI_tomorrow"] = df.groupby("City")["AQI"].shift(-1)
-    df = df.dropna(subset=["AQI_tomorrow"]).copy()
-    print(f"Dataset size with valid tomorrow target: {len(df):,} rows.")
-
-    # --------------------------------------------------------------------------
-    # 5. FEATURE SELECTION
-    # --------------------------------------------------------------------------
-    # We select 9 core pollutant features plus 'Month' (to capture seasonal smog/monsoon).
-    #
-    # WHY SKIP BENZENE, TOLUENE, XYLENE?
-    # Benzene, Toluene, and Xylene (BTX) are missing in >60% of Indian monitoring stations
-    # and are not standard outputs of global atmospheric models like Open-Meteo.
-    #
-    # WHY NOT USE TODAY'S AQI AS A FEATURE?
-    # If we include today's AQI, the model would simply predict "tomorrow ≈ today" and
-    # ignore individual chemical pollutants. Excluding today's AQI forces the model
-    # to learn the genuine physical relationship between chemical concentrations and AQI.
-    # Also, we do NOT use city name so our model generalizes to any Indian coordinate!
-    # --------------------------------------------------------------------------
-    print("\n--- Step 5: Preparing Feature Columns ---")
+    # extract month from date to help the model learn seasonal patterns (e.g., winter smog vs monsoon)
     df["Month"] = df["Date"].dt.month
     feature_names = pollutant_cols + ["Month"]
     print(f"Features used ({len(feature_names)}): {', '.join(feature_names)}")
@@ -147,27 +52,22 @@ def load_and_preprocess_data(csv_path):
     return df, feature_names
 
 
-# ------------------------------------------------------------------------------
-# 6. TIME-BASED TRAIN / TEST SPLIT
-# ------------------------------------------------------------------------------
-# We do NOT use a random train_test_split.
-# Why? Because in time-series forecasting, "we can't use the future to predict the past".
-# A random split causes data leakage where the model cheats using future weather patterns.
-# Instead, we sort strictly by Date: the first 80% is train, the last 20% is test.
-# ------------------------------------------------------------------------------
 def split_data(df, feature_names):
-    print("\n--- Step 6: Time-based Train / Test Split ---")
+    # time-based split: sort all records strictly by date
+    # we don't use random train_test_split here to prevent data leakage (we shouldn't use future data to predict the past)
     df = df.sort_values(by="Date").reset_index(drop=True)
 
+    # first 80% of dates for training, last 20% for testing
     split_idx = int(len(df) * 0.8)
     train_df = df.iloc[:split_idx].copy()
     test_df = df.iloc[split_idx:].copy()
 
+    # separate input features (X) and target variable (y) - predicting current instant's AQI
     X_train = train_df[feature_names]
-    y_train = train_df["AQI_tomorrow"]
+    y_train = train_df["AQI"]
 
     X_test = test_df[feature_names]
-    y_test = test_df["AQI_tomorrow"]
+    y_test = test_df["AQI"]
 
     print(f"Training set:   {len(train_df):,} rows ({train_df['Date'].min().date()} to {train_df['Date'].max().date()})")
     print(f"Test set:       {len(test_df):,} rows ({test_df['Date'].min().date()} to {test_df['Date'].max().date()})")
@@ -175,19 +75,12 @@ def split_data(df, feature_names):
     return X_train, y_train, X_test, y_test, test_df
 
 
-# ------------------------------------------------------------------------------
-# 7 & 8. TRAIN AND EVALUATE 4 MODELS + NAIVE BASELINE
-# ------------------------------------------------------------------------------
-# We compare:
-#   1. Linear Regression (baseline parametric model with StandardScaler)
-#   2. Decision Tree (non-linear baseline with max_depth=10)
-#   3. Random Forest (ensemble bagging of 200 trees, handles non-linear interactions)
-#   4. Gradient Boosting (ensemble boosting, iteratively reduces residuals)
-# ------------------------------------------------------------------------------
 def train_and_evaluate_models(X_train, y_train, X_test, y_test, test_df, feature_names):
-    print("\n--- Step 7: Training Models ---")
-
-    # Define the 4 model pipelines / estimators
+    # setting up 4 different regression models to compare their performance:
+    # 1. Linear Regression: baseline linear model; we wrap it in a Pipeline with StandardScaler because scale matters for regression
+    # 2. Decision Tree: non-linear model; max_depth=10 prevents the tree from overfitting too deeply
+    # 3. Random Forest: ensemble bagging method; combines 200 trees to reduce variance and handle complex interactions
+    # 4. Gradient Boosting: ensemble boosting method; builds trees sequentially, each correcting the previous tree's errors
     model_dict = {
         "Linear Regression": Pipeline([
             ("scaler", StandardScaler()),
@@ -210,28 +103,34 @@ def train_and_evaluate_models(X_train, y_train, X_test, y_test, test_df, feature
 
     metrics = {}
     feature_importances = {}
-    test_eval_df = test_df[["City", "Date", "AQI", "AQI_tomorrow"]].copy()
+    test_eval_df = test_df[["City", "Date", "AQI"]].copy()
+    test_eval_df["AQI_tomorrow"] = test_eval_df["AQI"]  # backwards compatibility
 
-    # Naive Baseline: assume tomorrow's AQI is identical to today's AQI
-    naive_predictions = test_df["AQI"]
+    # naive baseline: persistence benchmark (predicting current AQI using yesterday's AQI)
+    # missing yesterday values fallback to training set median
+    naive_predictions = test_df["AQI_yesterday"].fillna(y_train.median())
     naive_mae = float(mean_absolute_error(y_test, naive_predictions))
     metrics["naive_baseline_mae"] = round(naive_mae, 2)
 
     print("\n" + "=" * 68)
     print(f"{'Model':<22} | {'MAE':<8} | {'RMSE':<8} | {'R²':<8}")
     print("=" * 68)
-    print(f"{'Naive (Today=Tomorrow)':<22} | {naive_mae:<8.2f} | {'N/A':<8} | {'N/A':<8}")
+    print(f"{'Naive (Yesterday AQI)':<22} | {naive_mae:<8.2f} | {'N/A':<8} | {'N/A':<8}")
     print("-" * 68)
 
+    # train each model and evaluate on the unseen test set
     for name, model in model_dict.items():
-        # Fit model on training data
+        # fit the model on our training data
         model.fit(X_train, y_train)
 
-        # Predict on test set
+        # generate predictions on test data
         y_pred = model.predict(X_test)
         test_eval_df[f"Pred_{name}"] = y_pred
 
-        # Calculate metrics
+        # evaluation metrics:
+        # MAE: Mean Absolute Error (average magnitude of errors in AQI points)
+        # RMSE: Root Mean Squared Error (penalizes large outlier errors more heavily)
+        # R2: Coefficient of Determination (proportion of variance explained by the model)
         mae = float(mean_absolute_error(y_test, y_pred))
         rmse = float(root_mean_squared_error(y_test, y_pred))
         r2 = float(r2_score(y_test, y_pred))
@@ -244,16 +143,16 @@ def train_and_evaluate_models(X_train, y_train, X_test, y_test, test_df, feature
 
         print(f"{name:<22} | {mae:<8.2f} | {rmse:<8.2f} | {r2:<8.4f}")
 
-        # Extract feature importances
-        # For tree models: feature_importances_
-        # For linear regression: absolute standardized coefficients
+        # calculate feature importances:
+        # for tree models we use feature_importances_
+        # for linear regression we take the absolute value of the standardized coefficients
         if name == "Linear Regression":
             regressor = model.named_steps["regressor"]
             importances = np.abs(regressor.coef_)
         else:
             importances = model.feature_importances_
 
-        # Normalize to sum to 1.0 or store as dictionary mapping feature to weight
+        # normalize importances so they sum to 1.0 (easy to compare as percentages)
         total_imp = importances.sum()
         norm_imp = (importances / total_imp) if total_imp > 0 else importances
         feature_importances[name] = {feat: round(float(val), 4) for feat, val in zip(feature_names, norm_imp)}
@@ -263,17 +162,9 @@ def train_and_evaluate_models(X_train, y_train, X_test, y_test, test_df, feature
     return model_dict, metrics, feature_importances, test_eval_df
 
 
-# ------------------------------------------------------------------------------
-# 9. SAVE ARTIFACTS (metrics.json & models.pkl)
-# ------------------------------------------------------------------------------
-# Save all trained models, slider statistics for the app sidebar, feature names,
-# and metrics comparison.
-# ------------------------------------------------------------------------------
 def save_artifacts(model_dict, metrics, feature_importances, full_df, feature_names, test_eval_df):
-    print("--- Step 9: Saving artifacts ---")
-
-    # 1. Slider statistics for features not provided by the live API (NO, NOx, NH3)
-    # Range = dataset min to 95th percentile; default = dataset median
+    # compute min, max, and median for pollutants not returned by live APIs (NO, NOx, NH3)
+    # these are used in the Streamlit app sidebar sliders so the user has realistic default values
     slider_info = {}
     for col in ["NO", "NOx", "NH3"]:
         slider_info[col] = {
@@ -282,13 +173,13 @@ def save_artifacts(model_dict, metrics, feature_importances, full_df, feature_na
             "median": round(float(full_df[col].median()), 2)
         }
 
-    # 2. Save metrics.json
+    # save evaluation metrics to a json file for easy display in the web app
     metrics_path = "metrics.json"
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=4)
     print(f"[✓] Saved metrics to: {metrics_path}")
 
-    # 3. Save models.pkl with joblib
+    # save trained models, feature names, importances, and test predictions into models.pkl using joblib
     models_path = "models.pkl"
     payload = {
         "models": model_dict,
@@ -296,38 +187,33 @@ def save_artifacts(model_dict, metrics, feature_importances, full_df, feature_na
         "feature_importances": feature_importances,
         "slider_info": slider_info,
         "naive_baseline_mae": metrics["naive_baseline_mae"],
-        "test_eval_df": test_eval_df  # Used for Tab 3 actual vs predicted test chart
+        "test_eval_df": test_eval_df
     }
     joblib.dump(payload, models_path)
     print(f"[✓] Saved trained models & metadata to: {models_path}")
 
 
-# ------------------------------------------------------------------------------
-# MAIN EXECUTION FLOW
-# ------------------------------------------------------------------------------
 def main():
-    print("==================================================================")
-    print("        AirCast India - AQI Tomorrow Prediction Training         ")
-    print("==================================================================")
+    print("Starting AQI prediction model training...")
 
-    # 1. Ensure dataset exists
-    csv_path = ensure_dataset()
+    # path to our dataset
+    csv_path = "data/city_day.csv"
 
-    # 2-5. Load, clean, engineer target and features
+    # load and preprocess dataset
     df, feature_names = load_and_preprocess_data(csv_path)
 
-    # 6. Time-based split
+    # split into train and test sets chronologically
     X_train, y_train, X_test, y_test, test_df = split_data(df, feature_names)
 
-    # 7-8. Train all 4 models and evaluate
+    # train and evaluate our 4 regression models
     model_dict, metrics, feature_importances, test_eval_df = train_and_evaluate_models(
         X_train, y_train, X_test, y_test, test_df, feature_names
     )
 
-    # 9. Save metrics.json and models.pkl
+    # save the models and evaluation metrics for deployment
     save_artifacts(model_dict, metrics, feature_importances, df, feature_names, test_eval_df)
 
-    print("\n[✓] All training steps completed successfully!")
+    print("\nTraining completed successfully!")
 
 
 if __name__ == "__main__":

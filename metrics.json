@@ -1,23 +1,23 @@
 {
     "naive_baseline_mae": 21.34,
     "Linear Regression": {
-        "mae": 25.61,
-        "rmse": 39.78,
-        "r2": 0.8047
+        "mae": 22.05,
+        "rmse": 32.4,
+        "r2": 0.8704
     },
     "Decision Tree": {
-        "mae": 24.57,
-        "rmse": 49.85,
-        "r2": 0.6933
+        "mae": 19.19,
+        "rmse": 36.85,
+        "r2": 0.8323
     },
     "Random Forest": {
-        "mae": 21.17,
-        "rmse": 38.38,
-        "r2": 0.8182
+        "mae": 16.82,
+        "rmse": 28.2,
+        "r2": 0.9018
     },
     "Gradient Boosting": {
-        "mae": 21.95,
-        "rmse": 38.72,
-        "r2": 0.815
+        "mae": 17.83,
+        "rmse": 27.88,
+        "r2": 0.904
     }
 }

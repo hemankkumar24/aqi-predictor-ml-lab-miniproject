@@ -794,9 +794,10 @@ with tab3:
         pred_col = f"Pred_{selected_model}"
 
         fig_eval = go.Figure()
+        actual_aqi_series = city_eval["AQI"] if "AQI" in city_eval.columns else city_eval["AQI_tomorrow"]
         fig_eval.add_trace(go.Scatter(
             x=city_eval["Date"],
-            y=city_eval["AQI_tomorrow"],
+            y=actual_aqi_series,
             mode="lines",
             name="Actual AQI",
             line=dict(color="#00E400", width=2.5)
